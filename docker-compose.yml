@@ -1,0 +1,15 @@
+services:
+  aws-rag:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - chroma-data:/app/data/chroma
+    restart: unless-stopped
+
+volumes:
+  chroma-data:

@@ -8,8 +8,15 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "chromadb>=1.5.0",
     "fastapi>=0.141.1",
+    "google-genai>=1.38.0",
+    "langchain>=1.4.0",
+    "langgraph>=1.0.0",
+    "langchain-text-splitters>=1.1.2",
     "langsmith>=0.12.5",
+    "pandas>=3.0.5",
+    "pdfplumber>=0.11.10",
     "pydantic-settings>=2.15.0",
     "python-dotenv>=1.2.3",
     "slowapi>=0.1.10",
