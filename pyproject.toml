@@ -1,0 +1,24 @@
+[project]
+name = "aws-rag"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Hamza Nasser", email = "hasan.nasser012@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.141.1",
+    "langsmith>=0.12.5",
+    "pydantic-settings>=2.15.0",
+    "python-dotenv>=1.2.3",
+    "slowapi>=0.1.10",
+    "uvicorn>=0.53.0",
+]
+
+[project.scripts]
+aws-rag = "aws_rag:main"
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
