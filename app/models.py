@@ -24,6 +24,10 @@ class ChatResponse(BaseModel):
     model_used: str
     cached: bool = False
     processing_time_ms: float
+    final_message_for_llm: str = Field(
+        default="",
+        description="The exact sanitized and masked message that was sent to the LLM after security filtering.",
+    )
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="The timestamp when the response was generated.")
 
 
@@ -41,9 +45,19 @@ class MetricsResponse (BaseModel):
     total_errors: int
     error_rate: str
     avg_latency_ms: float
+    cache_hits: int
+    cache_misses: int
     cache_hit_rate: str
-    total_input_tokens: int  
+    total_input_tokens: int
     total_output_tokens: int
+
+
+class CacheStatsResponse(BaseModel):
+    """outgoing response model for cache stats endpoint"""
+    hits: int
+    misses: int
+    hit_rate: str
+    cached_entries: int
 
 
 class ErrorResponse(BaseModel):

@@ -68,7 +68,6 @@ class MetricsCollector:
         input_tokens: int = 0,
         output_tokens: int = 0,
         error: bool = False,
-        cache_hit: bool = False,
     ):
         """Record a single request's metrics."""
         self._requests_total += 1
@@ -79,6 +78,9 @@ class MetricsCollector:
 
         if error:
             self._errors_total += 1
+
+    def record_cache_result(self, cache_hit: bool) -> None:
+        """Track actual cache lookups independent from request metrics."""
         if cache_hit:
             self._cache_hits += 1
         else:
@@ -106,6 +108,8 @@ class MetricsCollector:
             "total_errors": self._errors_total,
             "error_rate": f"{error_rate:.2%}",
             "avg_latency_ms": round(avg_latency, 2),
+            "cache_hits": self._cache_hits,
+            "cache_misses": self._cache_misses,
             "cache_hit_rate": f"{cache_hit_rate:.2%}",
             "total_input_tokens": self._tokens_input,
             "total_output_tokens": self._tokens_output,

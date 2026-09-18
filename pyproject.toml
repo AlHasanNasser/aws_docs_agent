@@ -21,6 +21,9 @@ dependencies = [
     "python-dotenv>=1.2.3",
     "slowapi>=0.1.10",
     "uvicorn>=0.53.0",
+    "langchain-classic>=1.0.8",
+    "langchain-chroma>=1.1.0",
+    "langchain-google-genai>=4.4.0",
 ]
 
 [project.scripts]

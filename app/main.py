@@ -7,7 +7,13 @@ from app.agent import GeminiAnswerProvider, RAGAgent
 from app.cache import ResponseCache
 from app.config import get_settings
 from app.embeddings import ChromaVectorStore, GeminiEmbeddingProvider
-from app.models import ChatRequest, ChatResponse, HealthResponse, MetricsResponse
+from app.models import (
+	CacheStatsResponse,
+	ChatRequest,
+	ChatResponse,
+	HealthResponse,
+	MetricsResponse,
+)
 from app.monitoring import MetricsCollector, RequestTimer
 
 
@@ -23,8 +29,8 @@ def _configure_langsmith() -> None:
 
 
 app = FastAPI(title="AWS RAG API", version="0.1.0")
-cache = ResponseCache()
 metrics = MetricsCollector()
+cache = ResponseCache(ttl_seconds=get_settings().cache_ttl_seconds, metrics=metrics)
 
 
 @lru_cache(maxsize=1)
@@ -59,16 +65,29 @@ def get_metrics() -> MetricsResponse:
 	return MetricsResponse(**metrics.summary)
 
 
+
+@app.get("/cache/stats", response_model=CacheStatsResponse)
+def get_cache_stats() -> CacheStatsResponse:
+	return CacheStatsResponse(**cache.stats)
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest) -> ChatResponse:
 	settings = get_settings()
 	timer = RequestTimer()
+	agent = get_agent()
+	allowed, cleaned_message, notes = agent.security.check_input(request.message)
+	if not allowed:
+		metrics.record_request(timer.elapsed_ms, error=True)
+		raise HTTPException(status_code=400, detail=notes[0] if notes else "Question was rejected")
+
 	try:
 		with timer:
 			cached_response = cache.get(request.message)
 			if cached_response is None:
-				result = get_agent().ask(request.message)
+				result = agent.ask(cleaned_message)
 				cache.set(request.message, result.text)
+			final_llm_message = agent.last_prompt_for_llm
 	except ValueError as error:
 		metrics.record_request(timer.elapsed_ms, error=True)
 		raise HTTPException(status_code=400, detail=str(error)) from error
@@ -77,20 +96,22 @@ def chat(request: ChatRequest) -> ChatResponse:
 		raise HTTPException(status_code=500, detail="Unable to answer request") from error
 
 	if cached_response is not None:
-		metrics.record_request(timer.elapsed_ms, cache_hit=True)
+		metrics.record_request(timer.elapsed_ms)
 		return ChatResponse(
 			response=cached_response,
 			thread_id=request.thread_id,
 			model_used=settings.primary_model,
 			cached=True,
 			processing_time_ms=timer.elapsed_ms,
+			final_message_for_llm=final_llm_message or cleaned_message,
 		)
 
-	metrics.record_request(timer.elapsed_ms, cache_hit=False)
+	metrics.record_request(timer.elapsed_ms)
 	return ChatResponse(
 		response=result.text,
 		thread_id=request.thread_id,
 		model_used=settings.primary_model,
 		cached=False,
 		processing_time_ms=timer.elapsed_ms,
+		final_message_for_llm=final_llm_message or cleaned_message,
 	)

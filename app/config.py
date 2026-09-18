@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     google_api_key: str
     primary_model: str = "gemini-3.1-flash-lite"
     fallback_model: str = "gemini-2.5-flash"
+    embedding_model: str = "gemini-embedding-001"
     langchain_tracing_v2: bool = True
     langchain_api_key: str = ""
     langchain_project: str = "aws-rag"

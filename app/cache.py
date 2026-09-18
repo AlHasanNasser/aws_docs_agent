@@ -5,7 +5,10 @@ In-memory cache with TTL for LLM response deduplication.
 
 import hashlib
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from app.monitoring import MetricsCollector
 
 
 class ResponseCache:
@@ -18,11 +21,12 @@ class ResponseCache:
     - Built-in TTL management
     """
 
-    def __init__(self, ttl_seconds: int = 300):
+    def __init__(self, ttl_seconds: int = 300, metrics: Optional["MetricsCollector"] = None):
         self.ttl = ttl_seconds
         self._cache: dict[str, dict] = {}
         self._hits = 0
         self._misses = 0
+        self.metrics = metrics
 
     def _make_key(self, query: str) -> str:
         """Create a cache key from the normalized query."""
@@ -43,12 +47,14 @@ class ResponseCache:
             # Check TTL
             if time.time() - entry["timestamp"] < self.ttl:
                 self._hits += 1
+                if self.metrics is not None:
+                    self.metrics.record_cache_result(True)
                 return entry["response"]
-            else:
-                # Expired - remove it
-                del self._cache[key]
+            del self._cache[key]
 
         self._misses += 1
+        if self.metrics is not None:
+            self.metrics.record_cache_result(False)
         return None
 
     def set(self, query: str, response: str) -> None:

@@ -1,201 +1,386 @@
-import hashlib
-import json
-from collections.abc import Iterable
-from pathlib import Path
-from typing import Any, Protocol
+import sys
+from typing import Literal
 
-import chromadb
-from google import genai
-from google.genai import types
-
+from langchain_classic.prompts import ChatPromptTemplate
+from langchain_protocol import TypedDict
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
+from langchain_google_genai import  GoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langgraph.graph import END, StateGraph 
+from chunking import chunk_documents
+from extracting import extract_pdfs_from_folder
 from dotenv import load_dotenv
+load_dotenv()  # Load environment variables from .env file
 
-load_dotenv()
+class RAGState(TypedDict):
 
-
-
-class EmbeddingProvider(Protocol):
-	"""Provider interface used by the Chroma indexer."""
-
-	def embed(self, text: str) -> list[float]: ...
-
-
-class GeminiEmbeddingProvider:
-	"""Create retrieval embeddings with Google's Gemini API."""
-
-	def __init__(
-		self,
-		*,
-		model_id: str = "gemini-embedding-001",
-		api_key: str | None = None,
-		dimensions: int = 768,
-	) -> None:
-		self.model_id = model_id
-		self.dimensions = dimensions
-		self.client = genai.Client(api_key=api_key)
-
-	def embed(
-		self,
-		text: str,
-		*,
-		task_type: str = "RETRIEVAL_DOCUMENT",
-	) -> list[float]:
-		response = self.client.models.embed_content(
-			model=self.model_id,
-			contents=text,
-			config=types.EmbedContentConfig(
-				task_type=task_type,
-				output_dimensionality=self.dimensions,
-			),
-		)
-		if not response.embeddings or not response.embeddings[0].values:
-			raise RuntimeError("Gemini returned an empty embedding")
-		return list(response.embeddings[0].values)
-
-	def embed_query(self, text: str) -> list[float]:
-		"""Embed a search query using Gemini's query task type."""
-		return self.embed(text, task_type="RETRIEVAL_QUERY")
+    query: str
+    rewritten_query: str
+    documents: list[Document]
+    generation: str
+    relevance_score: float
+    retry_count: int
+    max_retries: int
 
 
-class ChromaVectorStore:
-	"""Persist embeddings in a local or shared Chroma collection."""
-
-	def __init__(
-		self,
-		*,
-		path: str = "data/chroma",
-		collection_name: str = "aws-rag-chunks",
-		client: Any | None = None,
-	) -> None:
-		self.client = client or chromadb.PersistentClient(path=path)
-		self.collection = self.client.get_or_create_collection(
-			name=collection_name,
-			metadata={"hnsw:space": "cosine"},
-		)
-
-	def index_batch(
-		self,
-		chunks: Iterable[dict[str, Any]],
-		provider: EmbeddingProvider,
-	) -> int:
-		ids: list[str] = []
-		documents: list[str] = []
-		embeddings: list[list[float]] = []
-		metadatas: list[dict[str, Any]] = []
-		count = 0
-		for chunk in chunks:
-			content = str(chunk["content"])
-			metadata = dict(chunk.get("metadata", {}))
-			ids.append(_chunk_id(content, metadata))
-			documents.append(content)
-			embeddings.append(provider.embed(content))
-			metadatas.append(_chroma_metadata(metadata))
-			count += 1
-
-		if ids:
-			self.collection.upsert(
-				ids=ids,
-				documents=documents,
-				embeddings=embeddings,
-				metadatas=metadatas,
-			)
-		return count
-
-	def delete_sources(self, sources: set[str]) -> int:
-		"""Delete every stored chunk belonging to the supplied source paths."""
-		if not sources:
-			return 0
-
-		stored = self.collection.get(include=["metadatas"])
-		ids_to_delete = [
-		document_id
-		for document_id, metadata in zip(
-			stored.get("ids", []), stored.get("metadatas", []), strict=True
-		)
-		if metadata and metadata.get("source") in sources
-		]
-		if ids_to_delete:
-			self.collection.delete(ids=ids_to_delete)
-		return len(ids_to_delete)
-
-	def remove_deleted_documents(
-		self,
-		folder_path: str | Path = "docs",
-		*,
-		recursive: bool = True,
-	) -> int:
-		"""Remove chunks whose source PDF no longer exists in a folder."""
-		folder_path = Path(folder_path)
-		pattern = "**/*.pdf" if recursive else "*.pdf"
-		current_sources = {
-			str(path)
-			for path in folder_path.glob(pattern)
-			if path.is_file()
-		}
-
-		stored = self.collection.get(include=["metadatas"])
-		stale_ids = [
-			document_id
-			for document_id, metadata in zip(
-				stored.get("ids", []), stored.get("metadatas", []), strict=True
-			)
-			if metadata
-			and metadata.get("source")
-			and metadata["source"] not in current_sources
-		]
-		if stale_ids:
-			self.collection.delete(ids=stale_ids)
-		return len(stale_ids)
-
-	def search(
-		self,
-		query_embedding: list[float],
-		*,
-		n_results: int = 5,
-	) -> dict[str, Any]:
-		"""Find the nearest stored chunks for a query embedding."""
-		return self.collection.query(
-			query_embeddings=[query_embedding],
-			n_results=n_results,
-		)
 
 
-def _chroma_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-	"""Keep metadata scalar because Chroma rejects nested values."""
-	return {
-		key: value
-		for key, value in metadata.items()
-		if isinstance(value, (str, int, float, bool))
-	}
+def create_sample_vectorstore() -> Chroma:
+    """Create a sample vectorstore for testing."""
+    # Create a sample vectorstore with some documents
+    embedding = GoogleGenerativeAIEmbeddings(
+        model="gemini-embedding-001",
+    )
+
+    extracted_docs = extract_pdfs_from_folder("docs")
+    chunked_docs = chunk_documents(extracted_docs)
+    documents = [Document(page_content=chunk["content"], metadata=chunk["metadata"]) for chunk in chunked_docs]
+
+    vectorstore = Chroma.from_documents(documents, embedding=embedding,collection_name="rag_vectorstore")
+    return vectorstore
 
 
-def _chunk_id(content: str, metadata: dict[str, Any]) -> str:
-	identity = json.dumps(
-		{"content": content, "metadata": metadata},
-		sort_keys=True,
-		default=str,
-	).encode("utf-8")
-	return hashlib.sha256(identity).hexdigest()
+def retrieve_documents(state: RAGState) -> dict:
+    """
+    Retrieve documents based on the query.
+    Uses rewritten_query if available, otherwise original query.
+    """
+    query = state.get("rewritten_query") or state["query"]
+
+    print(f"\n[RETRIEVE] Searching for: '{query}'")
+
+    vectorstore = state.get("_vectorstore")  # Injected at runtime
+    if not vectorstore:
+        # Fallback - create new (in production, pass via config)
+        
+        vectorstore = create_sample_vectorstore()
+
+    retriever = vectorstore.as_retriever(search_type="similarity",search_kwargs={"k": 3})
+    documents = retriever.invoke(query)
+
+    print(f"[RETRIEVE] Found {len(documents)} documents")
+    for i, doc in enumerate(documents, 1):
+        print(
+            f"  {i}. {doc.metadata.get('source', 'unknown')}: {doc.page_content[:50]}"
+        )
+
+    return {"documents": documents}
 
 
-def index_chunks(
-	chunks: Iterable[dict[str, Any]],
-	*,
-	store: ChromaVectorStore,
-	provider: EmbeddingProvider,
-	batch_size: int = 32,
-) -> int:
-	"""Embed and persist chunks incrementally in Chroma."""
-	if batch_size < 1:
-		raise ValueError("batch_size must be at least 1")
+def grade_documents(state: RAGState) -> dict:
+    """
+    Grade retrieved documents for relevance to the query.
+    This is the KEY difference from traditional RAG - we evaluate before generating.
+    """
+    query = state["query"]
+    documents = state["documents"]
 
-	batch: list[dict[str, Any]] = []
-	indexed = 0
-	for chunk in chunks:
-		batch.append(chunk)
-		if len(batch) >= batch_size:
-			indexed += store.index_batch(batch, provider)
-			batch.clear()
-	if batch:
-		indexed += store.index_batch(batch, provider)
-	return indexed
+    print(f"\n[GRADE] Evaluating {len(documents)} documents for relevance...")
+
+    llm = GoogleGenerativeAI(model="gemini-3.1-flash-lite", temperature=0)
+
+    grading_prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """You are a relevance grader. Given a user query and a document,
+determine if the document contains information relevant to answering the query.
+
+Output ONLY a number between 0 and 1:
+- 1.0 = Highly relevant, directly answers the query
+- 0.7 = Somewhat relevant, contains related information
+- 0.3 = Marginally relevant, tangentially related
+- 0.0 = Not relevant at all
+
+Output ONLY the number, nothing else.""",
+            ),
+            (
+                "human",
+                """Query: {query}
+
+Document: {document}
+
+Relevance score (0-1):""",
+            ),
+        ]
+    )
+
+    # Grade each document and calculate average
+    scores = []
+    relevant_docs = []
+
+    for doc in documents:
+        chain = grading_prompt | llm
+        result = chain.invoke({"query": query, "document": doc.page_content})
+
+        try:
+            score = float(result)
+        except ValueError:
+            score = 0.5  # Default if parsing fails
+
+        scores.append(score)
+        print(f"  - {doc.metadata.get('source', 'unknown')}: {score:.2f}")
+
+        if score >= 0.5:  # Keep documents with score >= 0.5
+            relevant_docs.append(doc)
+
+    avg_score = sum(scores) / len(scores) if scores else 0
+    print(f"[GRADE] Average relevance: {avg_score:.2f}")
+    print(f"[GRADE] Keeping {len(relevant_docs)}/{len(documents)} documents")
+
+    return {"documents": relevant_docs, "relevance_score": avg_score}
+
+def rewrite_query(state: RAGState) -> dict:
+    """
+    Rewrite the query to improve retrieval.
+    Called when initial retrieval doesn't find relevant documents.
+    """
+    query = state["query"]
+    retry_count = state.get("retry_count", 0)
+
+    print(f"\n[REWRITE] Attempt {retry_count + 1}: Improving query...")
+
+    llm = GoogleGenerativeAI(model="gemini-3.1-flash-lite", temperature=0.3)
+
+    rewrite_prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """You are a query rewriter for a RAG system.
+The original query didn't retrieve relevant documents.
+
+Rewrite the query to be more specific and likely to match relevant documents.
+Consider:
+- Adding synonyms or related terms
+- Being more specific about what information is needed
+- Rephrasing to match how documentation is typically written
+
+Output ONLY the rewritten query, nothing else.""",
+            ),
+            (
+                "human",
+                """Original query: {query}
+
+Rewritten query:""",
+            ),
+        ]
+    )
+
+    chain = rewrite_prompt | llm
+    result = chain.invoke({"query": query})
+    rewritten = result
+
+    print(f"[REWRITE] Original: '{query}'")
+    print(f"[REWRITE] Rewritten: '{rewritten}'")
+
+    return {"rewritten_query": rewritten, "retry_count": retry_count + 1}
+
+
+def generate_answer(state: RAGState) -> dict:
+    """
+    Generate the final answer using retrieved documents.
+    """
+    query = state["query"]
+    documents = state["documents"]
+
+    print(f"\n[GENERATE] Creating answer from {len(documents)} documents...")
+
+    llm = GoogleGenerativeAI(model="gemini-3.1-flash-lite", temperature=0)
+
+    # Format documents
+    context = "\n\n".join(
+        [
+            f"Source: {doc.metadata.get('source', 'unknown')}\n{doc.page_content}"
+            for doc in documents
+        ]
+    )
+
+    generate_prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """You are a helpful assistant answering questions based on provided context.
+
+Use ONLY the information in the context to answer. If the context doesn't contain
+enough information, say so clearly.
+
+Always cite your sources by mentioning which document the information came from.""",
+            ),
+            (
+                "human",
+                """Context:
+{context}
+
+Question: {query}
+
+Answer:""",
+            ),
+        ]
+    )
+
+    chain = generate_prompt | llm
+    result = chain.invoke({"context": context, "query": query})
+
+    print(f"[GENERATE] Answer generated")
+
+    return {"generation": result}
+
+
+
+
+def generate_fallback(state: RAGState) -> dict:
+    """
+    Generate a fallback response when retrieval fails after all retries.
+    """
+    query = state["query"]
+
+    print(f"\n[FALLBACK] Retrieval failed after {state.get('retry_count', 0)} attempts")
+
+    fallback_message = f"""I couldn't find relevant information to answer your question: "{query}"
+
+This could mean:
+1. The information isn't in my knowledge base
+2. Try rephrasing your question with different terms
+3. The topic might not be covered in the available documents
+
+Would you like to try a different question?"""
+
+    return {"generation": fallback_message}
+
+
+def should_retry_or_generate(
+    state: RAGState,
+) -> Literal["rewrite", "generate", "fallback"]:
+    """
+    Decide whether to retry retrieval or proceed to generation.
+
+    This is the BRAIN of agentic RAG - making decisions based on retrieval quality.
+    """
+    relevance_score = state.get("relevance_score", 0)
+    retry_count = state.get("retry_count", 0)
+    max_retries = state.get("max_retries", 2)
+    documents = state.get("documents", [])
+
+    print(
+        f"\n[ROUTER] Evaluating: score={relevance_score:.2f}, retries={retry_count}/{max_retries}, docs={len(documents)}"
+    )
+
+    # If we have relevant documents, generate
+    if relevance_score >= 0.5 and len(documents) > 0:
+        print("[ROUTER] -> GENERATE (good relevance)")
+        return "generate"
+
+    # If we can retry, rewrite query
+    if retry_count < max_retries:
+        print("[ROUTER] -> REWRITE (low relevance, retrying)")
+        return "rewrite"
+
+    # Out of retries
+    if len(documents) > 0:
+        print("[ROUTER] -> GENERATE (out of retries, using available docs)")
+        return "generate"
+    else:
+        print("[ROUTER] -> FALLBACK (no relevant documents)")
+        return "fallback"
+
+
+
+
+
+def build_agentic_rag_graph():
+    """
+    Build the LangGraph workflow for agentic RAG.
+
+    Flow:
+    1. retrieve -> grade -> [decision]
+    2. If low relevance and retries left: rewrite -> retrieve (loop)
+    3. If good relevance or out of retries: generate
+    4. If no documents at all: fallback
+    """
+
+    # Create the graph with our state schema
+    workflow = StateGraph(RAGState)
+
+    # Add nodes
+    workflow.add_node("retrieve", retrieve_documents)
+    workflow.add_node("grade", grade_documents)
+    workflow.add_node("rewrite", rewrite_query)
+    workflow.add_node("generate", generate_answer)
+    workflow.add_node("fallback", generate_fallback)
+
+    # Set entry point
+    workflow.set_entry_point("retrieve")
+
+    # Add edges
+    workflow.add_edge("retrieve", "grade")
+
+    # Conditional edge from grade
+    workflow.add_conditional_edges(
+        "grade",
+        should_retry_or_generate,
+        {"rewrite": "rewrite", "generate": "generate", "fallback": "fallback"},
+    )
+
+    # After rewrite, go back to retrieve
+    workflow.add_edge("rewrite", "retrieve")
+
+    # Terminal nodes
+    workflow.add_edge("generate", END)
+    workflow.add_edge("fallback", END)
+
+    # Compile the graph
+    app = workflow.compile()
+
+    return app
+
+
+def run_demo():
+    """Run the agentic RAG demo."""
+
+    print("=" * 60)
+    print("AGENTIC RAG DEMO")
+    print("=" * 60)
+
+    # Create vector store
+    print("\nSetting up vector store...")
+    vectorstore = create_sample_vectorstore()
+
+    # Build the graph
+    print("Building agentic RAG graph...")
+    app = build_agentic_rag_graph()
+
+    # Test queries
+    test_queries = [
+        "elt",  # Should find relevant docs
+        
+        
+    ]
+
+    for query in test_queries:
+        print("\n" + "=" * 60)
+        print(f"QUERY: {query}")
+        print("=" * 60)
+
+        # Run the graph
+        initial_state = {
+            "query": query,
+            "rewritten_query": "",
+            "documents": [],
+            "generation": "",
+            "relevance_score": 0.0,
+            "retry_count": 0,
+            "max_retries": 2,
+            "_vectorstore": vectorstore,  # Pass vectorstore via state
+        }
+
+        result = app.invoke(initial_state)
+
+        print("\n" + "-" * 60)
+        print("FINAL ANSWER:")
+        print("-" * 60)
+        print(result["generation"])
+
+    # Cleanup
+    vectorstore.delete_collection()
+
+run_demo()
