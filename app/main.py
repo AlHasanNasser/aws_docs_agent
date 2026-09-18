@@ -1,117 +1,250 @@
+"""
+Production-Ready FastAPI + LangGraph Application
+
+Wires together:
+- Security pipeline (input sanitization, PII masking)
+- Response caching
+- Rate limiting (slowapi)
+- LangGraph agent (with retries + fallback)
+- Structured logging + metrics
+- LangSmith tracing
+- Health checks
+"""
+
+import time
 import os
-from functools import lru_cache
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from langsmith import traceable
+from dotenv import load_dotenv
 
-from app.agent import GeminiAnswerProvider, RAGAgent
-from app.cache import ResponseCache
 from app.config import get_settings
-from app.embeddings import ChromaVectorStore, GeminiEmbeddingProvider
 from app.models import (
-	CacheStatsResponse,
-	ChatRequest,
-	ChatResponse,
-	HealthResponse,
-	MetricsResponse,
+    ChatRequest, ChatResponse,
+    HealthResponse, MetricsResponse, ErrorResponse,
 )
-from app.monitoring import MetricsCollector, RequestTimer
+from app.security import SecurityPipeline
+from app.cache import ResponseCache
+from app.monitoring import get_logger, MetricsCollector, RequestTimer
+from app.agent import ProductionAgent
+
+load_dotenv()
 
 
-def _configure_langsmith() -> None:
-	settings = get_settings()
-	if settings.langchain_api_key:
-		os.environ.setdefault("LANGCHAIN_API_KEY", settings.langchain_api_key)
-		os.environ.setdefault(
-			"LANGCHAIN_TRACING_V2",
-			str(settings.langchain_tracing_v2).lower(),
-		)
-		os.environ.setdefault("LANGCHAIN_PROJECT", settings.langchain_project)
+
+# === Global instances (initialized in lifespan) ===
+security: SecurityPipeline = None
+cache: ResponseCache = None
+metrics: MetricsCollector = None
+agent: ProductionAgent = None
+logger = get_logger()
 
 
-app = FastAPI(title="AWS RAG API", version="0.1.0")
-metrics = MetricsCollector()
-cache = ResponseCache(ttl_seconds=get_settings().cache_ttl_seconds, metrics=metrics)
+# === Lifespan (startup/shutdown) ===
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Initialize all components on startup, clean up on shutdown.
+    This is the modern FastAPI pattern (replaces @app.on_event).
+    """
+    global security, cache, metrics, agent
+
+    settings = get_settings()
+
+    logger.info("Starting production API...", extra={"extra_data": {
+        "environment": settings.app_env,
+        "primary_model": settings.primary_model,
+        "tracing_enabled": settings.langchain_tracing_v2,
+    }})
+
+    # Initialize components
+    security = SecurityPipeline()
+    cache = ResponseCache(ttl_seconds=settings.cache_ttl_seconds)
+    metrics = MetricsCollector()
+    agent = ProductionAgent()
+
+    logger.info("All components initialized. Ready to serve requests.")
+
+    yield  # App is running
+
+    # Shutdown
+    logger.info("Shutting down...", extra={"extra_data": metrics.summary})
+    
+    
+    # === Rate Limiter Setup ===
+limiter = Limiter(key_func=get_remote_address)
+
+# === FastAPI App ===
+app = FastAPI(
+    title="Production LangGraph API",
+    description="A production-ready chat API with security, caching, and observability.",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+app.state.limiter = limiter
 
 
-@lru_cache(maxsize=1)
-def get_agent() -> RAGAgent:
-	_configure_langsmith()
-	settings = get_settings()
-	embeddings = GeminiEmbeddingProvider(api_key=settings.google_api_key)
-	return RAGAgent(
-		store=ChromaVectorStore(
-			path="data/chroma",
-			collection_name="aws-rag-gemini",
-		),
-		embeddings=embeddings,
-		answer_provider=GeminiAnswerProvider(api_key=settings.google_api_key),
-		n_results=5,
-	)
+# === Exception Handlers ===
 
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    """Handle rate limit exceeded errors."""
+    logger.warning("Rate limit exceeded", extra={"extra_data": {
+        "client_ip": get_remote_address(request),
+    }})
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": "Rate limit exceeded",
+            "detail": "Too many requests. Please slow down.",
+        },
+    )
+    
 
+# =============================================
+# ENDPOINTS
+# =============================================
+
+@app.post("/chat", response_model=ChatResponse)
+@limiter.limit(get_settings().rate_limit)
+@traceable(name="chat_endpoint")
+async def chat(request: Request, body: ChatRequest):
+    """
+    Main chat endpoint.
+
+    Flow:
+    1. Security check (injection + PII masking)
+    2. Cache lookup
+    3. LangGraph agent invoke (if cache miss)
+    4. Output validation
+    5. Cache store
+    6. Return response
+    """
+    with RequestTimer() as timer:
+        security_notes = []
+
+        # ---- Step 1: Security Check ----
+        is_allowed, cleaned_message, notes = security.check_input(body.message)
+        security_notes.extend(notes)
+
+        if not is_allowed:
+            logger.warning("Request blocked by security", extra={"extra_data": {
+                "reason": notes,
+                "thread_id": body.thread_id,
+            }})
+            metrics.record_request(latency_ms=0, error=True)
+            raise HTTPException(
+                status_code=400,
+                detail="Your message was blocked by our security filters."
+            )
+
+        # ---- Step 2: Cache Lookup ----
+        cached_response = cache.get(cleaned_message)
+        if cached_response is not None:
+            metrics.record_request(latency_ms=0)
+            logger.info("Cache hit", extra={"extra_data": {
+                "thread_id": body.thread_id,
+            }})
+            return ChatResponse(
+                response=cached_response,
+                thread_id=body.thread_id,
+                model_used="cache",
+                cached=True,
+                processing_time_ms=0,
+            )
+
+        # ---- Step 3: Invoke LangGraph Agent ----
+        try:
+            result = agent.invoke(cleaned_message)
+        except Exception as e:
+            logger.error(f"Agent invocation failed: {e}", extra={"extra_data": {
+                "thread_id": body.thread_id,
+                "error": str(e),
+            }})
+            metrics.record_request(latency_ms=0, error=True)
+            raise HTTPException(
+                status_code=500,
+                detail="An error occurred while processing your request."
+            )
+
+        response_text = result["response"]
+        model_used = result["model_used"]
+
+        # ---- Step 4: Output Validation ----
+        validated_response, output_warnings = security.check_output(response_text)
+        security_notes.extend(output_warnings)
+
+        # ---- Step 5: Cache Store ----
+        cache.set(cleaned_message, validated_response)
+
+    # ---- Step 6: Log & Record Metrics ----
+    input_tokens = int(len(cleaned_message.split()) * 1.3)
+    output_tokens = int(len(validated_response.split()) * 1.3)
+
+    metrics.record_request(
+        latency_ms=timer.elapsed_ms,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+
+    if security_notes:
+        logger.info("Security notes", extra={"extra_data": {
+            "notes": security_notes,
+            "thread_id": body.thread_id,
+        }})
+
+    logger.info("Request completed", extra={"extra_data": {
+        "thread_id": body.thread_id,
+        "model_used": model_used,
+        "latency_ms": round(timer.elapsed_ms, 2),
+    }})
+
+    return ChatResponse(
+        response=validated_response,
+        thread_id=body.thread_id,
+        model_used=model_used,
+        cached=False,
+        processing_time_ms=round(timer.elapsed_ms, 2),
+        security_notes=security_notes,
+    )
+    
+    
+    
+    
 @app.get("/health", response_model=HealthResponse)
-def health() -> HealthResponse:
-	settings = get_settings()
-	return HealthResponse(
-		status="healthy",
-		environment=settings.app_env,
-		version="1.0.0",
-		checks={"vector_store": "configured", "agent": "configured"},
-	)
+async def health():
+    """Health check for Docker/Kubernetes."""
+    settings = get_settings()
+
+    checks = {
+        "agent": agent is not None,
+        "security": security is not None,
+        "cache": cache is not None,
+    }
+
+    all_healthy = all(checks.values())
+
+    return HealthResponse(
+        status="healthy" if all_healthy else "degraded",
+        environment=settings.app_env,
+        checks=checks,
+    )
 
 
 @app.get("/metrics", response_model=MetricsResponse)
-def get_metrics() -> MetricsResponse:
-	return MetricsResponse(**metrics.summary)
+async def get_metrics():
+    """Metrics for monitoring dashboards."""
+    summary = metrics.summary
+    return MetricsResponse(**summary)
 
 
-
-@app.get("/cache/stats", response_model=CacheStatsResponse)
-def get_cache_stats() -> CacheStatsResponse:
-	return CacheStatsResponse(**cache.stats)
-
-
-@app.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest) -> ChatResponse:
-	settings = get_settings()
-	timer = RequestTimer()
-	agent = get_agent()
-	allowed, cleaned_message, notes = agent.security.check_input(request.message)
-	if not allowed:
-		metrics.record_request(timer.elapsed_ms, error=True)
-		raise HTTPException(status_code=400, detail=notes[0] if notes else "Question was rejected")
-
-	try:
-		with timer:
-			cached_response = cache.get(request.message)
-			if cached_response is None:
-				result = agent.ask(cleaned_message)
-				cache.set(request.message, result.text)
-			final_llm_message = agent.last_prompt_for_llm
-	except ValueError as error:
-		metrics.record_request(timer.elapsed_ms, error=True)
-		raise HTTPException(status_code=400, detail=str(error)) from error
-	except Exception as error:
-		metrics.record_request(timer.elapsed_ms, error=True)
-		raise HTTPException(status_code=500, detail="Unable to answer request") from error
-
-	if cached_response is not None:
-		metrics.record_request(timer.elapsed_ms)
-		return ChatResponse(
-			response=cached_response,
-			thread_id=request.thread_id,
-			model_used=settings.primary_model,
-			cached=True,
-			processing_time_ms=timer.elapsed_ms,
-			final_message_for_llm=final_llm_message or cleaned_message,
-		)
-
-	metrics.record_request(timer.elapsed_ms)
-	return ChatResponse(
-		response=result.text,
-		thread_id=request.thread_id,
-		model_used=settings.primary_model,
-		cached=False,
-		processing_time_ms=timer.elapsed_ms,
-		final_message_for_llm=final_llm_message or cleaned_message,
-	)
+@app.get("/cache/stats")
+async def cache_stats():
+    """Cache performance statistics."""
+    return cache.stats

@@ -1,14 +1,18 @@
 import sys
-from typing import Literal
+from typing import Any, Literal
 
 from langchain_classic.prompts import ChatPromptTemplate
+from langchain_classic.retrievers import EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever 
+from langchain_classic.schema import BaseRetriever
 from langchain_protocol import TypedDict
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
+from langchain_core.runnables import Runnable
 from langchain_google_genai import  GoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langgraph.graph import END, StateGraph 
-from chunking import chunk_documents
-from extracting import extract_pdfs_from_folder
+from app.chunking import chunk_documents
+from app.extracting import extract_pdfs_from_folder
 from dotenv import load_dotenv
 load_dotenv()  # Load environment variables from .env file
 
@@ -17,15 +21,18 @@ class RAGState(TypedDict):
     query: str
     rewritten_query: str
     documents: list[Document]
+    prompt: str
+    failed: str
     generation: str
     relevance_score: float
     retry_count: int
     max_retries: int
+    _vectorstore: Any
 
 
 
 
-def create_sample_vectorstore() -> Chroma:
+def create_sample_vectorstore() -> Chroma | None:
     """Create a sample vectorstore for testing."""
     # Create a sample vectorstore with some documents
     embedding = GoogleGenerativeAIEmbeddings(
@@ -34,6 +41,9 @@ def create_sample_vectorstore() -> Chroma:
 
     extracted_docs = extract_pdfs_from_folder("docs")
     chunked_docs = chunk_documents(extracted_docs)
+    if not chunked_docs:
+        return None
+
     documents = [Document(page_content=chunk["content"], metadata=chunk["metadata"]) for chunk in chunked_docs]
 
     vectorstore = Chroma.from_documents(documents, embedding=embedding,collection_name="rag_vectorstore")
@@ -52,11 +62,31 @@ def retrieve_documents(state: RAGState) -> dict:
     vectorstore = state.get("_vectorstore")  # Injected at runtime
     if not vectorstore:
         # Fallback - create new (in production, pass via config)
-        
         vectorstore = create_sample_vectorstore()
 
-    retriever = vectorstore.as_retriever(search_type="similarity",search_kwargs={"k": 3})
-    documents = retriever.invoke(query)
+    if vectorstore is None:
+        return {"documents": []}
+
+    vector_retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
+    corpus_documents = state.get("document_chunks") or getattr(
+        getattr(vectorstore, "retriever", None), "documents", []
+    )
+    if not corpus_documents:
+        corpus_documents = [
+            Document(page_content=content, metadata=metadata)
+            for content, metadata in zip(
+                vectorstore.get(include=["documents", "metadatas"])["documents"],
+                vectorstore.get(include=["documents", "metadatas"])["metadatas"],
+            )
+        ]
+
+    bm25_retriever = BM25Retriever.from_documents(corpus_documents, k=2)
+    if not isinstance(vector_retriever, Runnable):
+        return {"documents": vector_retriever.invoke(query)}
+
+    hybrid_retriever = EnsembleRetriever(retrievers=[vector_retriever, bm25_retriever], weights=[0.5, 0.5])
+
+    documents = hybrid_retriever.invoke(query)
 
     print(f"[RETRIEVE] Found {len(documents)} documents")
     for i, doc in enumerate(documents, 1):
@@ -185,7 +215,7 @@ def generate_answer(state: RAGState) -> dict:
 
     print(f"\n[GENERATE] Creating answer from {len(documents)} documents...")
 
-    llm = GoogleGenerativeAI(model="gemini-3.1-flash-lite", temperature=0)
+    
 
     # Format documents
     context = "\n\n".join(
@@ -218,12 +248,12 @@ Answer:""",
         ]
     )
 
-    chain = generate_prompt | llm
-    result = chain.invoke({"context": context, "query": query})
+         
+    result = generate_prompt.invoke({"context": context, "query": query})
 
     print(f"[GENERATE] Answer generated")
 
-    return {"generation": result}
+    return {"prompt": result.to_string()}
 
 
 
@@ -245,7 +275,7 @@ This could mean:
 
 Would you like to try a different question?"""
 
-    return {"generation": fallback_message}
+    return {"failed": fallback_message}
 
 
 def should_retry_or_generate(
@@ -266,12 +296,12 @@ def should_retry_or_generate(
     )
 
     # If we have relevant documents, generate
-    if relevance_score >= 0.5 and len(documents) > 0:
+    if relevance_score >= 0.2 and len(documents) > 0:
         print("[ROUTER] -> GENERATE (good relevance)")
         return "generate"
 
     # If we can retry, rewrite query
-    if retry_count < max_retries:
+    if retry_count < max_retries :
         print("[ROUTER] -> REWRITE (low relevance, retrying)")
         return "rewrite"
 
@@ -333,54 +363,3 @@ def build_agentic_rag_graph():
 
     return app
 
-
-def run_demo():
-    """Run the agentic RAG demo."""
-
-    print("=" * 60)
-    print("AGENTIC RAG DEMO")
-    print("=" * 60)
-
-    # Create vector store
-    print("\nSetting up vector store...")
-    vectorstore = create_sample_vectorstore()
-
-    # Build the graph
-    print("Building agentic RAG graph...")
-    app = build_agentic_rag_graph()
-
-    # Test queries
-    test_queries = [
-        "elt",  # Should find relevant docs
-        
-        
-    ]
-
-    for query in test_queries:
-        print("\n" + "=" * 60)
-        print(f"QUERY: {query}")
-        print("=" * 60)
-
-        # Run the graph
-        initial_state = {
-            "query": query,
-            "rewritten_query": "",
-            "documents": [],
-            "generation": "",
-            "relevance_score": 0.0,
-            "retry_count": 0,
-            "max_retries": 2,
-            "_vectorstore": vectorstore,  # Pass vectorstore via state
-        }
-
-        result = app.invoke(initial_state)
-
-        print("\n" + "-" * 60)
-        print("FINAL ANSWER:")
-        print("-" * 60)
-        print(result["generation"])
-
-    # Cleanup
-    vectorstore.delete_collection()
-
-run_demo()

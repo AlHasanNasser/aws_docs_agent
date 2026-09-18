@@ -10,7 +10,7 @@ from langgraph.graph.message import add_messages
 from langchain_google_genai import GoogleGenerativeAI
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 from langsmith import traceable
-
+from app.embeddings import build_agentic_rag_graph, create_sample_vectorstore
 from app.config import get_settings
 
 
@@ -118,14 +118,64 @@ class ProductionAgent:
             else:
                 return "error"
 
+        def retrival(state: AgentState) -> dict:
+            message = state["messages"][-1].content
+            vectorstore = create_sample_vectorstore()
+            if vectorstore is None:
+                return {
+                    "messages": [AIMessage(content=(
+                        "I couldn't answer because the knowledge base is empty. "
+                        "Please add source documents and try again."
+                    ))],
+                    "error": "knowledge_base_empty",
+                    "model_used": "retrieval",
+                }
+
+            initial_state = {
+                        "query": message,
+                        "rewritten_query": "",
+                        "documents": [],
+                        "prompt": "",
+                        "failed": "",
+                        "generation": "",
+                        "relevance_score": 0.0,
+                        "retry_count": 0,
+                        "max_retries": 2,
+                        "_vectorstore": vectorstore,  # Pass vectorstore via state
+                    }
+
+            rag= build_agentic_rag_graph()
+            result = rag.invoke(initial_state)
+
+            if result.get("prompt"):
+                return {
+                    "messages": [HumanMessage(content=result["prompt"])],
+                    "error": None,
+                }
+
+            return {
+                "messages": [AIMessage(content=result.get("failed", "Retrieval failed."))],
+                "error": "retrieval_failed",
+            }
+
+        def route_after_retrieval(state: AgentState) -> str:
+            """Send only the retrieval-built prompt to the answer model."""
+            return "process" if state.get("error") is None else "done"
+
         # Build the graph
         graph = StateGraph(AgentState)
-
+        graph.add_node("retrival", retrival)
         graph.add_node("process", process_message)
         graph.add_node("fallback", try_fallback)
         graph.add_node("error", handle_error)
 
-        graph.add_edge(START, "process")
+        graph.add_edge(START, "retrival")
+
+        graph.add_conditional_edges(
+            "retrival",
+            route_after_retrieval,
+            {"process": "process", "done": END},
+        )
         graph.add_conditional_edges(
             "process",
             route_after_process,
